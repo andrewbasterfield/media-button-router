@@ -31,6 +31,8 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ResolveInfo;
 import android.media.AudioManager;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.PowerManager;
 import android.os.PowerManager.WakeLock;
 import android.preference.PreferenceManager;
@@ -41,6 +43,8 @@ import com.harleensahni.android.mbr.Constants;
 import com.harleensahni.android.mbr.ReceiverSelector;
 import com.harleensahni.android.mbr.ReceiverSelectorLocked;
 import com.harleensahni.android.mbr.Utils;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 /**
  * Handles routing media button intents to application that is playing music
@@ -49,12 +53,111 @@ import com.harleensahni.android.mbr.Utils;
  */
 public class MediaButtonReceiver extends BroadcastReceiver {
 
+    /*
+     * Debounce time (ms). Duplicate intents with the same keyCode will be ignored within this window
+     */
+    private final int debounceDelay = 1000;
+
+    /*
+     * Quantity of duplicated intents to let through
+     * A value of 1 means only let through the original and ignore the copies
+     */
+    private final int debounceQuantity = 1;
+
+    /*
+     * The time delay between processing a media key intent and re-registering ourselves as the sole receiver of media key intents.
+     * This is to counteract Google Play Music re-registering itself as the sole receiver of media key intents each time we sent it an intent.
+     * This can be set to 0 to disable this behaviour.
+     */
+    private final int reregisterDelay = 500;
+
+    /*
+     * Last time we processed an event
+     */
+    private static long lastEventTime = 0;
+
+    /*
+     * Keycode of last media key intent processed
+     */
+    private static int lastKeyCode = KeyEvent.KEYCODE_UNKNOWN;
+
+    /*
+     * Number of times this keycode has been seen back-to-back within the debounce time window
+     */
+    private static int bounceCounter = 0;
+
+    /*
+     * Scheduler for call-back
+     */
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
     @Override
-    public void onReceive(Context context, Intent intent) {
+    public void onReceive(final Context context, Intent intent) {
 
         SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(context);
         if (!preferences.getBoolean(Constants.ENABLED_PREF_KEY, true)) {
             return;
+        }
+
+        /*
+         * Debounce media buttons
+         */
+        if (Intent.ACTION_MEDIA_BUTTON.equals(intent.getAction())) {
+            KeyEvent keyEvent = (KeyEvent) intent.getExtras().get(Intent.EXTRA_KEY_EVENT);
+            int keyCode = Utils.getAdjustedKeyCode(keyEvent);
+            if (Utils.isMediaButton(keyCode)) {
+
+                Log.i(TAG, "Media Button Receiver: received media button intent: " + intent + " keycode: " + keyCode);
+
+                long now = System.currentTimeMillis();
+                if ((now - lastEventTime) < debounceDelay) {
+                    if (lastKeyCode == keyCode) {
+                        if (bounceCounter >= debounceQuantity) {
+                            Log.i(TAG, "Media Button Receiver: too soon, ignoring: " + intent);
+                            if (isOrderedBroadcast()) {
+                                Log.i(TAG, "Media Button Receiver: aborting ordered broadcast: " + intent);
+                                abortBroadcast();
+                            }
+                            return;
+                        }
+                        bounceCounter++;
+                    } else {
+                        /*
+                         * different keyCode, reset the counter
+                         */
+                        bounceCounter = 0;
+                    }
+                } else {
+                    /*
+                     * It has been long enough since last event to reset the counter
+                     */
+                    bounceCounter = 0;
+                }
+                lastEventTime = now;
+                lastKeyCode = keyCode;
+
+                Log.i(TAG, "Media Button Receiver: allowing media button intent: " + intent + " keycode: " + keyCode);
+            }
+        }
+
+        /*
+         * Google Music will re-register itself as sole media button receiver when it is passed any media button events
+         * Wait a little bit and do the same thing ourselves...
+         */
+        if (reregisterDelay > 0) {
+            Runnable beeper = new Runnable() {
+                public void run() {
+                    Log.i(TAG, "Media Button Receiver: re-registering as sole media button event receiver");
+                    AudioManager mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+                    ComponentName mComponentName = new ComponentName(context.getPackageName(), MediaButtonReceiver.class.getName());
+                    mAudioManager.registerMediaButtonEventReceiver(mComponentName);
+                }
+            };
+
+            HandlerThread hThread = new HandlerThread("registerMediaButtonEventReceiverThread");
+            hThread.start();
+            Handler handler = new Handler(hThread.getLooper());
+            handler.postDelayed(beeper, reregisterDelay);
         }
 
         ActivityManager activityManager = ((ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE));
